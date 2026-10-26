@@ -1,8 +1,8 @@
 name: promote
 
-# Reusable develop → main promotion. Opens one develop → main pull request and
+# Reusable develop → main (or `base`) promotion. Opens one develop → base pull request and
 # refreshes its summary when develop moves again before it is merged; closes it
-# when develop is no longer ahead of main. Callers decide when it runs (normally
+# when develop is no longer ahead of base. Callers decide when it runs (normally
 # after their CI passes on a develop push) and must grant
 # contents: read and pull-requests: write.
 
@@ -14,9 +14,19 @@ on:
         type: string
         default: ""
       merge-note:
-        description: Repo-specific line for the PR body, e.g. what merging to main deploys.
+        description: Repo-specific line for the PR body, e.g. what merging to the base branch deploys.
         type: string
         default: ""
+      base:
+        description: Branch develop is promoted onto (e.g. master for repos that never renamed it).
+        type: string
+        default: main
+      runs-on:
+        description: >-
+          Runner for the job: a label (ubuntu-latest) or a JSON array of labels,
+          e.g. '["self-hosted","linux"]'. The runner needs git, gh and jq.
+        type: string
+        default: ubuntu-latest
 
 permissions:
   contents: read
@@ -24,7 +34,7 @@ permissions:
 
 jobs:
   pull-request:
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,18 +46,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MERGE_NOTE: ${{ inputs.merge-note }}
+          BASE: ${{ inputs.base }}
         run: |
           set -euo pipefail
 
-          git fetch --no-tags origin main
+          git fetch --no-tags origin "$BASE"
 
-          ahead=$(git rev-list --count origin/main..HEAD)
+          ahead=$(git rev-list --count "origin/$BASE"..HEAD)
           # Same-repo pull requests match --head develop. owner:branch matches a fork only,
           # and that miss is what made the second push try to open a duplicate.
           find_pr() {
             gh pr list \
               --repo "$GITHUB_REPOSITORY" \
-              --base main \
+              --base "$BASE" \
               --head develop \
               --state open \
               --json number,isCrossRepository \
@@ -59,17 +70,17 @@ jobs:
             if [ -n "$existing" ]; then
               gh pr close "$existing" \
                 --repo "$GITHUB_REPOSITORY" \
-                --comment "develop has no commits that main does not already contain, so this promotion pull request is closed."
-              echo "Closed #$existing; develop is not ahead of main."
+                --comment "develop has no commits that $BASE does not already contain, so this promotion pull request is closed."
+              echo "Closed #$existing; develop is not ahead of $BASE."
             else
-              echo "develop is not ahead of main; nothing to promote."
+              echo "develop is not ahead of $BASE; nothing to promote."
             fi
             exit 0
           fi
 
           body_file=$(mktemp)
           {
-            echo "Merging this pull request promotes \`develop\` onto \`main\`."
+            echo "Merging this pull request promotes \`develop\` onto \`$BASE\`."
             echo
             if [ -n "$MERGE_NOTE" ]; then
               printf '%s\n\n' "$MERGE_NOTE"
@@ -85,7 +96,7 @@ jobs:
               if [ "$count" -le "$limit" ]; then
                 printf '%s\n' "$line"
               fi
-            done < <(git log --reverse --pretty=tformat:'- %s (%h)' origin/main..HEAD)
+            done < <(git log --reverse --pretty=tformat:'- %s (%h)' "origin/$BASE"..HEAD)
             if [ "$count" -gt "$limit" ]; then
               echo
               echo "... and $((count - limit)) more"
@@ -94,13 +105,13 @@ jobs:
             echo "## Files"
             echo
             echo '```'
-            git diff --stat origin/main...HEAD
+            git diff --stat "origin/$BASE"...HEAD
             echo '```'
             echo
             echo "Maintained by the shared \`ggrace519/.github\` promote workflow. A later push to \`develop\` updates this description; notes left in the description are replaced, so put them in a comment."
           } > "$body_file"
 
-          title="Promote develop to main"
+          title="Promote develop to $BASE"
           update_pr() {
             # REST, not gh pr edit: that command queries Projects (classic) and fails
             # once GitHub returns the deprecation error.
@@ -116,7 +127,7 @@ jobs:
           create_log=$(mktemp)
           if gh pr create \
             --repo "$GITHUB_REPOSITORY" \
-            --base main \
+            --base "$BASE" \
             --head develop \
             --title "$title" \
             --body-file "$body_file" \

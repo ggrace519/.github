@@ -32,13 +32,15 @@ jobs:
     with:
       ref: ${{ github.event.workflow_run.head_sha }}
       # merge-note: "What merging to main deploys, if anything."
+      # base: master   # promotion target; defaults to main
+      # runs-on: '["self-hosted","linux"]'   # label or JSON array; defaults to ubuntu-latest
 ```
 
 Requirements:
 - The default branch must be `develop`. `workflow_run` only fires for workflows on the default branch.
 - Turn on Settings → Actions → "Allow GitHub Actions to create and approve pull requests":
   `gh api -X PUT repos/OWNER/REPO/actions/permissions/workflow -f default_workflow_permissions=read -F can_approve_pull_request_reviews=true`
-- A pull request opened with `GITHUB_TOKEN` does not trigger `pull_request` workflows. A required status check on `main` that only runs on `pull_request` will therefore never report for this pull request.
+- CI does run on the promotion pull request. Because this workflow starts from a `workflow_run` chain, GitHub credits the `pull_request` runs to the user whose push began the chain, not to `GITHUB_TOKEN`. tetris-c #14 showed this, with `triggering_actor` set to the pushing user. Required status checks on `main` therefore report as usual.
 
 Merge promotion pull requests with a merge commit, never a squash or rebase.
 
