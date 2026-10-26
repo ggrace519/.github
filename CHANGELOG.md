@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-25
+
 ### Added
 - `promote` takes an optional `base` input (default `main`) for repos whose promotion branch has another name, such as `master`. Existing callers are unaffected.
 - `promote` takes an optional `runs-on` input (a label or a JSON array of labels, default `ubuntu-latest`) so private callers can run the job on their self-hosted runners instead of spending GitHub-hosted minutes. Existing callers are unaffected.
