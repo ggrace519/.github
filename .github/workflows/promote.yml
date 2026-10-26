@@ -21,6 +21,12 @@ on:
         description: Branch develop is promoted onto (e.g. master for repos that never renamed it).
         type: string
         default: main
+      runs-on:
+        description: >-
+          Runner for the job: a label (ubuntu-latest) or a JSON array of labels,
+          e.g. '["self-hosted","linux"]'. The runner needs git, gh and jq.
+        type: string
+        default: ubuntu-latest
 
 permissions:
   contents: read
@@ -28,7 +34,7 @@ permissions:
 
 jobs:
   pull-request:
-    runs-on: ubuntu-latest
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
     steps:
       - uses: actions/checkout@v4
         with:
