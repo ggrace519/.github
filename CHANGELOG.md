@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Docs
+- The README now tells callers to pin a release's commit SHA instead of `@v1`, and describes the tag protection on release tags.
+
 ## [1.0.2] - 2026-10-27
 
 ### Changed
