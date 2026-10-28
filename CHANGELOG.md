@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [v1.0.2] - 2026-10-27
+## [1.0.2] - 2026-10-27
 
 ### Changed
 - `promote` and the lint workflow pin `actions/checkout` to a commit SHA (v4.4.0) instead of the mutable `v4` tag, so a moved upstream tag can no longer change what runs on callers' runners, including self-hosted ones.
