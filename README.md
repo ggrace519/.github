@@ -19,8 +19,13 @@ on:
 permissions:
   contents: read
   pull-requests: write
+# Only push-triggered and manual runs share the group. A develop merge also re-runs lint on the
+# open promotion PR; that run's promote job is skipped by `if`, but concurrency applies before
+# `if`, so in a shared group it would cancel the push run that does the work (#17).
 concurrency:
-  group: promote-develop-to-main
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push')
+        && 'promote-develop-to-main' || format('promote-skip-{0}', github.run_id) }}
   cancel-in-progress: true
 jobs:
   promote:
@@ -28,7 +33,7 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.event == 'push')
-    uses: ggrace519/.github/.github/workflows/promote.yml@v1
+    uses: ggrace519/.github/.github/workflows/promote.yml@56da419a93d4eca7fe1771297dc734fbd9c39fb4 # v1.0.2
     with:
       ref: ${{ github.event.workflow_run.head_sha }}
       # merge-note: "What merging to main deploys, if anything."
@@ -46,4 +51,6 @@ Merge promotion pull requests with a merge commit, never a squash or rebase.
 
 ## Versioning
 
-Callers pin `@v1`, which is a moving major tag. Breaking changes ship as `v2`.
+Releases are tagged `vX.Y.Z` on main, and `v1` is moved to the latest 1.x release. Breaking changes ship as `v2`. A tag ruleset (`protect-release-tags`) blocks moving or deleting `v*` tags for everyone except repo admins.
+
+Pin callers to a release's commit SHA, with the version in a comment, not to `@v1`. The workflow runs with write access to the caller's repo, often on self-hosted runners, so a moved tag would change that code without review. Bump the SHA in each caller on purpose when a new release ships.
