@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- The `release` workflow's step summary and dry-run log named the previous release twice over, as `v1.0.21.0.2`. They now read `v1.0.2`. Release notes and tags were never affected.
+
 ## [1.1.0] - 2026-11-07
 
 ### Changed

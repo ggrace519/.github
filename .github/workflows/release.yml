@@ -220,11 +220,13 @@ jobs:
           if [ -n "$latest" ] && ! semver_gt "$version" "$latest"; then
             fail "Release $version is not newer than the latest tag $PREFIX$latest."
           fi
+          previous=${latest:+$PREFIX$latest}
+          previous=${previous:-none}
 
           {
             echo "## $tag"
             echo
-            echo "Commit \`${sha:0:7}\`; previous release: ${latest:+$PREFIX$latest}${latest:-none}."
+            echo "Commit \`${sha:0:7}\`; previous release: $previous."
             echo
             cat "$notes"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -232,7 +234,7 @@ jobs:
           if [ "$DRY_RUN" = true ]; then
             echo "released=false" >> "$GITHUB_OUTPUT"
             echo "url=" >> "$GITHUB_OUTPUT"
-            echo "Dry run: $tag would be created at ${sha:0:7} (previous: ${latest:+$PREFIX$latest}${latest:-none})."
+            echo "Dry run: $tag would be created at ${sha:0:7} (previous: $previous)."
             exit 0
           fi
 
