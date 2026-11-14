@@ -1,0 +1,66 @@
+name: self-promote
+
+# This repository's own promotion. After lint passes on a develop push it rolls
+# the changelog into the next version (version.yml) and opens or refreshes the
+# develop → main pull request (promote.yml). On a pull request into develop it
+# only reports the release that pull request would produce. Both reusable
+# workflows are called from the same commit, so a change to them is exercised
+# here first.
+
+on:
+  workflow_run:
+    workflows: [lint]
+    types: [completed]
+    branches: [develop]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump; auto works it out from the changelog entries.
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+  pull_request:
+    branches: [develop]
+
+permissions: {}
+
+# Only push-triggered and manual runs share the group; see the caller template in the README (#17).
+concurrency:
+  group: >-
+    ${{ (github.event_name == 'workflow_dispatch' || github.event.workflow_run.event == 'push')
+        && 'promote-develop-to-main' || format('promote-skip-{0}', github.run_id) }}
+  cancel-in-progress: true
+
+jobs:
+  preview:
+    # Not for forks: their token cannot be granted the write access version.yml declares.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: write
+    uses: ./.github/workflows/version.yml
+    with:
+      dry-run: true
+
+  version:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    permissions:
+      contents: write
+    uses: ./.github/workflows/version.yml
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+      bump: ${{ inputs.bump || 'auto' }}
+
+  promote:
+    needs: version
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/promote.yml
+    with:
+      ref: ${{ needs.version.outputs.sha }}

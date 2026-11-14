@@ -49,12 +49,68 @@ Requirements:
 
 Merge promotion pull requests with a merge commit, never a squash or rebase.
 
+## version
+
+`.github/workflows/version.yml` is a reusable workflow that rolls the changelog before a promotion, so nobody edits version headings by hand. Run it after CI passes on `develop` and ahead of `promote`. It moves the entries under `## [Unreleased]` into a dated `## [X.Y.Z] - YYYY-MM-DD` section, commits that to `develop`, and hands the new commit to `promote`. The promotion pull request then already carries the changelog that `release` tags when it is merged. The tag itself is still created on `main` by the merge, never before it.
+
+The version is the latest release bumped by the highest level the entries ask for:
+
+| Entries since the last release | Bump |
+| --- | --- |
+| An entry that starts with `BREAKING` (`- BREAKING: ...`, bold or not), or a `### Breaking` heading | major |
+| A `### Added` heading | minor |
+| Anything else (`Changed`, `Fixed`, `Docs`, ...) | patch |
+
+On `0.x` a major bump becomes a minor one, and a repository with no release yet starts from `0.0.0`. The `bump` input (`patch`, `minor`, `major`) overrides the level for one run.
+
+A version section that has no tag and is not on `main` yet is pending. When `develop` moves again before the promotion is merged, the new entries are folded into the pending section category by category and its version is worked out again, so one promotion is one release. The version only moves up: edit the heading by hand (for example to `2.0.0`, or to a pre-release such as `1.3.0-rc.1`) and later runs keep it.
+
+To add it, replace the `jobs:` block of the `promote` caller above with this one and change the caller's permissions to `contents: write` and `pull-requests: write`:
+
+```yaml
+jobs:
+  version:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    uses: ggrace519/.github/.github/workflows/version.yml@<sha> # vX.Y.Z
+    with:
+      ref: ${{ github.event.workflow_run.head_sha }}
+      # bump: auto           # or patch, minor, major
+      # branch: develop      # receives the roll-up commit
+      # base: main           # promotion target
+      # changelog: CHANGELOG.md
+      # tag-prefix: v
+      # runs-on: '["self-hosted","linux"]'
+    # secrets:
+    #   token: ${{ secrets.RELEASE_TOKEN }}  # only to run CI on the roll-up unprompted or bypass a branch ruleset
+  promote:
+    needs: version
+    uses: ggrace519/.github/.github/workflows/promote.yml@<sha> # vX.Y.Z
+    with:
+      ref: ${{ needs.version.outputs.sha }}
+```
+
+Inputs: `ref`, `branch`, `base`, `changelog`, `tag-prefix`, `bump`, `dry-run`, `runs-on`. Outputs: `version`, `sha` (the commit to promote: the roll-up commit, or `ref` when there was nothing to roll) and `rolled` (`'true'` when this run committed).
+
+Notes:
+- The roll-up is a commit by `github-actions[bot]` directly on `develop`, titled `chore(release): roll changelog into X.Y.Z`. It is made through the API, so GitHub signs it. Pull `develop` before branching from it again. A branch cut before the roll-up that also adds an entry under `[Unreleased]` can conflict in the changelog when it is merged; keep the new entry under `[Unreleased]`.
+- A commit made with `GITHUB_TOKEN` starts no `push` workflow, so CI does not run on the roll-up, and the `pull_request` run it causes on the open promotion pull request waits for "Approve and run", like the first run on a new promotion pull request. Expect one approval per roll-up. A `token` secret (a fine-grained PAT with contents: write, or a GitHub App token) removes the wait; the run its push starts finds nothing left to roll and stops.
+- A branch ruleset on `develop` that requires pull requests refuses the commit for `GITHUB_TOKEN`. The run fails with an error that says so; pass a `token` that may bypass the ruleset.
+- When `develop` has moved past `ref` the run commits nothing. The run for the newer commit does the roll-up.
+- With `dry-run: true` nothing is committed and the next version and its section are written to the run summary. This repository runs that on every pull request into `develop`.
+- `ref` must be a commit of `develop`. A manual run started from another branch fails instead of committing.
+- Section headings must be `## [X.Y.Z] - YYYY-MM-DD`; a `## 1.2.0` heading without brackets fails the run. Headings inside fenced code blocks are left alone. CRLF line endings are kept.
+- Empty categories are dropped. Link reference definitions (`[1.2.0]: https://...`) are not created or updated; ones found under `[Unreleased]` move to the end of the file.
+- A promotion with no changelog entry at all is left alone and still fails the `release` check below.
+
 ## release
 
-`.github/workflows/release.yml` is a reusable workflow for repositories that keep a [Keep a Changelog](https://keepachangelog.com) `CHANGELOG.md` and semantic versions. On every push to `main` it reads the top `## [X.Y.Z] - YYYY-MM-DD` section. When that version has no tag yet, it creates the tag `vX.Y.Z` on the pushed commit and a GitHub release whose notes are that section. With `dry-run` it only validates, so the same workflow gates the promotion pull request: a promotion whose changelog is not ready fails its check before the merge.
+`.github/workflows/release.yml` is a reusable workflow for repositories that keep a [Keep a Changelog](https://keepachangelog.com) `CHANGELOG.md` and semantic versions. On every push to `main` it reads the top `## [X.Y.Z] - YYYY-MM-DD` section. When that version has no tag yet, it creates the tag `vX.Y.Z` on the pushed commit and a GitHub release whose notes are that section. With `dry-run` it only validates, so the same workflow gates the promotion pull request: a promotion whose changelog is not ready fails its check before the merge. The `version` workflow above gets the changelog ready on its own.
 
 It enforces, and fails with an `::error::` that names the fix:
-- `[Unreleased]` has no entries left; they were rolled into a dated version section.
+- `[Unreleased]` has no entries left; they were rolled into a dated version section, by hand or by `version`.
 - The top section is a semantic version with a date and at least one entry.
 - That version is newer than the latest existing tag.
 - If its tag already exists it points at this commit (a re-run, which is a no-op). Otherwise `main` moved without a new version.
@@ -102,6 +158,6 @@ Notes:
 
 ## Versioning
 
-Releases are tagged `vX.Y.Z` on main by `self-release.yml`, which runs the `release` workflow above on every push to `main` and validates the changelog on the promotion pull request. `v1` is moved to the latest 1.x release by the same run; the tag ruleset excludes the major tag so that `GITHUB_TOKEN` may move it. Breaking changes ship as `v2`. A tag ruleset (`protect-release-tags`) blocks moving or deleting `v*` tags for everyone except repo admins.
+`self-promote.yml` runs `version` and `promote` after lint passes on `develop`: it rolls `[Unreleased]` into the next version and opens the promotion pull request. Releases are tagged `vX.Y.Z` on main by `self-release.yml`, which runs the `release` workflow above on every push to `main` and validates the changelog on the promotion pull request. `v1` is moved to the latest 1.x release by the same run; the tag ruleset excludes the major tag so that `GITHUB_TOKEN` may move it. Breaking changes ship as `v2`. A tag ruleset (`protect-release-tags`) blocks moving or deleting `v*` tags for everyone except repo admins.
 
 Pin callers to a release's commit SHA, with the version in a comment, not to `@v1`. The workflow runs with write access to the caller's repo, often on self-hosted runners, so a moved tag would change that code without review. Bump the SHA in each caller on purpose when a new release ships.

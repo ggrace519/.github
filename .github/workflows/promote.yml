@@ -50,7 +50,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          git fetch --no-tags origin "$BASE"
+          git fetch --no-tags origin "$BASE" develop
+          # A manual run started from another branch would otherwise describe, or close,
+          # the pull request from the wrong commit.
+          if ! git merge-base --is-ancestor HEAD origin/develop; then
+            echo "::error::$(git rev-parse --short HEAD) is not on develop. Run this workflow for a commit of develop; a manual run must be started from that branch." >&2
+            exit 1
+          fi
 
           ahead=$(git rev-list --count "origin/$BASE"..HEAD)
           # Same-repo pull requests match --head develop. owner:branch matches a fork only,
