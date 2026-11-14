@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Test double for the two GitHub API calls version.yml makes. It answers them from
+# the local bare repository in $REMOTE, so a roll-up becomes a real git commit there.
+#   STUB_REFUSE=1    the commit mutation is refused
+#   STUB_REF_FAIL=1  reading the branch head fails
+set -euo pipefail
+if [ "$1 $2" = "api graphql" ]; then
+  req=$(cat)
+  if [ -n "${STUB_REFUSE:-}" ]; then
+    echo "GraphQL: refused" >&2
+    exit 1
+  fi
+  branch=$(jq -r .variables.input.branch.branchName <<< "$req")
+  expect=$(jq -r .variables.input.expectedHeadOid <<< "$req")
+  head=$(git -C "$REMOTE" rev-parse "refs/heads/$branch")
+  if [ "$head" != "$expect" ]; then
+    echo "GraphQL: Expected branch to point to $expect but it did not" >&2
+    exit 1
+  fi
+  work=$(mktemp -d)
+  git clone -q -b "$branch" "$REMOTE" "$work"
+  path=$(jq -r '.variables.input.fileChanges.additions[0].path' <<< "$req")
+  jq -r '.variables.input.fileChanges.additions[0].contents' <<< "$req" | base64 -d > "$work/$path"
+  git -C "$work" commit -qam "$(jq -r .variables.input.message.headline <<< "$req")"
+  git -C "$work" push -q origin "$branch"
+  echo "gh stub: a warning on stderr must not break the caller" >&2
+  git -C "$work" rev-parse HEAD
+  rm -rf "$work"
+elif [[ "$1 $2" == "api repos/"*"/git/ref/heads/"* ]]; then
+  if [ -n "${STUB_REF_FAIL:-}" ]; then
+    echo "gh: HTTP 502" >&2
+    exit 1
+  fi
+  git -C "$REMOTE" rev-parse "refs/heads/${2##*/git/ref/heads/}"
+else
+  echo "gh stub: unexpected call: $*" >&2
+  exit 64
+fi
