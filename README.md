@@ -95,11 +95,13 @@ jobs:
 Inputs: `ref`, `branch`, `base`, `changelog`, `tag-prefix`, `bump`, `dry-run`, `runs-on`. Outputs: `version`, `sha` (the commit to promote: the roll-up commit, or `ref` when there was nothing to roll) and `rolled` (`'true'` when this run committed).
 
 Notes:
-- The roll-up is a commit by `github-actions[bot]` directly on `develop`, titled `chore(release): roll changelog into X.Y.Z`. It is made through the API, so GitHub signs it. Pull `develop` before branching from it again.
+- The roll-up is a commit by `github-actions[bot]` directly on `develop`, titled `chore(release): roll changelog into X.Y.Z`. It is made through the API, so GitHub signs it. Pull `develop` before branching from it again. A branch cut before the roll-up that also adds an entry under `[Unreleased]` can conflict in the changelog when it is merged; keep the new entry under `[Unreleased]`.
 - A commit made with `GITHUB_TOKEN` starts no `push` workflow, so CI does not run on the roll-up, and the `pull_request` run it causes on the open promotion pull request waits for "Approve and run", like the first run on a new promotion pull request. Expect one approval per roll-up. A `token` secret (a fine-grained PAT with contents: write, or a GitHub App token) removes the wait; the run its push starts finds nothing left to roll and stops.
 - A branch ruleset on `develop` that requires pull requests refuses the commit for `GITHUB_TOKEN`. The run fails with an error that says so; pass a `token` that may bypass the ruleset.
 - When `develop` has moved past `ref` the run commits nothing. The run for the newer commit does the roll-up.
 - With `dry-run: true` nothing is committed and the next version and its section are written to the run summary. This repository runs that on every pull request into `develop`.
+- `ref` must be a commit of `develop`. A manual run started from another branch fails instead of committing.
+- Section headings must be `## [X.Y.Z] - YYYY-MM-DD`; a `## 1.2.0` heading without brackets fails the run. Headings inside fenced code blocks are left alone. CRLF line endings are kept.
 - Empty categories are dropped. Link reference definitions (`[1.2.0]: https://...`) are not created or updated; ones found under `[Unreleased]` move to the end of the file.
 - A promotion with no changelog entry at all is left alone and still fails the `release` check below.
 

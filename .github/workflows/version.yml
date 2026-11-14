@@ -115,6 +115,7 @@ jobs:
 
           semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
           linkdef='^\[[^]]+\]:\ '
+          fence='^[[:space:]]*(```|~~~)'
           # A list item that leads with the word, bold or not: `- BREAKING: ...`. A mention
           # further into an entry does not count.
           breaking='^[[:space:]]*[-*+][[:space:]]+(\*\*|__)?BREAKING'
@@ -162,8 +163,21 @@ jobs:
           top_heading=""
           top_version=""
           state=preamble
+          fenced=false
+          crlf=false
           while IFS= read -r line || [ -n "$line" ]; do
-            if [ "$state" != rest ] && [[ $line =~ ^##\ \[([^]]+)\] ]]; then
+            if [[ $line == *$'\r' ]]; then
+              crlf=true
+              line=${line%$'\r'}
+            fi
+            # Headings inside a fenced code block are text.
+            if [[ $line =~ $fence ]]; then
+              if [ "$fenced" = true ]; then fenced=false; else fenced=true; fi
+            elif [ "$fenced" = false ] && [ "$state" != rest ] && [[ $line =~ ^##\  && ! $line =~ ^##\ \[[^]]+\] ]]; then
+              if [ "$state" != preamble ]; then
+                fail "\"$line\" in $CHANGELOG is not a \`## [X.Y.Z] - YYYY-MM-DD\` heading; the sections cannot be told apart."
+              fi
+            elif [ "$fenced" = false ] && [ "$state" != rest ] && [[ $line =~ ^##\ \[([^]]+)\] ]]; then
               name=${BASH_REMATCH[1]}
               if [ "$state" = preamble ] && [ "${name,,}" = unreleased ]; then
                 state=unreleased
@@ -220,9 +234,14 @@ jobs:
             absorbed=$((absorbed + 1))
           }
           absorb() {
-            local key=":loose" chunk="" entry heading
+            local key=":loose" chunk="" entry heading inside=false
             for entry in "$@"; do
-              if [[ $entry =~ $linkdef ]]; then
+              if [[ $entry =~ $fence ]]; then
+                if [ "$inside" = true ]; then inside=false; else inside=true; fi
+                chunk+=$entry$'\n'
+              elif [ "$inside" = true ]; then
+                chunk+=$entry$'\n'
+              elif [[ $entry =~ $linkdef ]]; then
                 links+=("$entry")
               elif [[ $entry =~ ^###\ +(.*[^[:space:]])[[:space:]]*$ ]]; then
                 add_chunk "$key" "$chunk"
@@ -335,12 +354,20 @@ jobs:
             if [ "$pending" = false ] && [ -n "$top_heading" ]; then
               printf '%s\n' "$top_heading" ${top[@]+"${top[@]}"}
             fi
-            [ "${#rest[@]}" -eq 0 ] || printf '%s\n' "${rest[@]}"
+            last=""
+            if [ "${#rest[@]}" -gt 0 ]; then
+              printf '%s\n' "${rest[@]}"
+              last=${rest[-1]}
+            elif [ "$pending" = false ] && [ "${#top[@]}" -gt 0 ]; then
+              last=${top[-1]}
+            fi
             if [ "${#links[@]}" -gt 0 ]; then
-              echo
+              [ -z "${last//[[:space:]]/}" ] || echo
               printf '%s\n' "${links[@]}"
             fi
           } | trim_blank > "$rolled"
+          # A changelog with CRLF line endings keeps them.
+          if [ "$crlf" = true ]; then sed -i 's/$/\r/' "$rolled"; fi
 
           {
             echo "## Next release: $PREFIX$version"
@@ -358,19 +385,27 @@ jobs:
           branch_head() {
             gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$TARGET_BRANCH" --jq .object.sha
           }
-          moved() {
+          # $TARGET_BRANCH no longer ends at this commit. When it moved on, the run for its
+          # new head rolls the changelog; a commit that was never on it is a wrong `ref`.
+          not_head() {
+            git fetch --quiet --no-tags origin "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
+            if ! git merge-base --is-ancestor "$sha" "origin/$TARGET_BRANCH"; then
+              fail "${sha:0:7} is not on $TARGET_BRANCH. Run this workflow for a commit of $TARGET_BRANCH; a manual run must be started from that branch."
+            fi
             echo "::notice::$TARGET_BRANCH moved on from ${sha:0:7}; the run for its new head rolls the changelog."
             finish "$current" "$sha" false
           }
-          [ "$(branch_head)" = "$sha" ] || moved
+          head=$(branch_head) || fail "Could not read the head of $TARGET_BRANCH."
+          [ "$head" = "$sha" ] || not_head
 
           encoded=$(mktemp)
-          base64 -w 0 "$rolled" > "$encoded"
+          base64 < "$rolled" | tr -d '\n' > "$encoded"
           # createCommitOnBranch, not git push: GitHub signs the commit, and
           # expectedHeadOid refuses it when the branch moved under this run.
           # shellcheck disable=SC2016
           query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }'
           out=$(mktemp)
+          err=$(mktemp)
           if ! jq -n \
             --arg query "$query" \
             --arg repo "$GITHUB_REPOSITORY" \
@@ -384,9 +419,10 @@ jobs:
                expectedHeadOid: $oid,
                message: {headline: $headline},
                fileChanges: {additions: [{path: $path, contents: $contents}]}}}}' \
-            | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid > "$out" 2>&1; then
-            cat "$out" >&2
-            [ "$(branch_head)" = "$sha" ] || moved
+            | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid > "$out" 2> "$err"; then
+            cat "$out" "$err" >&2
+            head=$(branch_head) || fail "Committing the roll-up failed, and so did reading the head of $TARGET_BRANCH."
+            [ "$head" = "$sha" ] || not_head
             fail "Committing the roll-up to $TARGET_BRANCH was refused. A branch ruleset that requires pull requests applies to GITHUB_TOKEN too: pass a \`token\` that may bypass it."
           fi
           commit=$(cat "$out")

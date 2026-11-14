@@ -107,8 +107,12 @@ jobs:
           heading_rest=""
           unreleased_has_entries=false
           notes=$(mktemp)
+          fenced=false
           while IFS= read -r line || [ -n "$line" ]; do
-            if [[ $line =~ ^##\ \[([^]]+)\](.*)$ ]]; then
+            # Headings inside a fenced code block are text.
+            if [[ $line =~ ^[[:space:]]*(\`\`\`|~~~) ]]; then
+              if [ "$fenced" = true ]; then fenced=false; else fenced=true; fi
+            elif [ "$fenced" = false ] && [[ $line =~ ^##\ \[([^]]+)\](.*)$ ]]; then
               name=${BASH_REMATCH[1]}
               if [ "${name,,}" = unreleased ]; then
                 section=unreleased
@@ -121,7 +125,7 @@ jobs:
               fi
               continue
             fi
-            [[ $line =~ ^\[[^]]+\]:\  ]] && continue
+            [ "$fenced" = false ] && [[ $line =~ ^\[[^]]+\]:\  ]] && continue
             case $section in
               unreleased)
                 if [[ -n ${line//[[:space:]]/} && ! $line =~ ^###\  ]]; then
