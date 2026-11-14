@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+- Reusable `version` workflow. Before a promotion it works out the next semantic version from the entries under `[Unreleased]` (an entry that starts with `BREAKING` is a major bump, `### Added` a minor one, anything else a patch), rolls them into a dated version section and commits that to `develop`, so promotions no longer need a hand-edited changelog. Entries that land before the promotion is merged fold into the same version. The tag is still created on `main` by `release`. Existing callers are unaffected until they chain `version` ahead of `promote`.
+- This repository promotes itself with `version` and `promote` (`self-promote.yml`), and every pull request into `develop` reports the release it would produce.
+
 ### Fixed
 - The `release` workflow's step summary and dry-run log named the previous release twice over, as `v1.0.21.0.2`. They now read `v1.0.2`. Release notes and tags were never affected.
 

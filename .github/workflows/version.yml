@@ -1,0 +1,400 @@
+name: version
+
+# Reusable changelog roll-up for repositories that keep a Keep a Changelog
+# CHANGELOG.md and semantic versions. Run it on the integration branch (develop)
+# after CI passes and before `promote`. It works out the next version from the
+# entries under `## [Unreleased]`, moves them into a dated `## [X.Y.Z]` section
+# and commits that to the branch, so the promotion pull request already carries
+# the changelog that `release` tags on the merge.
+#
+# The version is the latest release bumped by the highest level its entries ask
+# for: an entry that starts with BREAKING or a `### Breaking` heading is a major
+# bump, a `### Added` heading a minor one, anything else a patch. On 0.x a major bump
+# is a minor one. A version section that is neither tagged nor on the base
+# branch is pending: later entries fold into it and its version is worked out
+# again, never downwards, so a hand-edited heading stands.
+#
+# The commit is made through the API, so GitHub signs it. Made with
+# GITHUB_TOKEN it starts no `push` workflow, and the `pull_request` run it
+# causes on an open promotion pull request waits for approval. Pass a `token`
+# secret to have both run on their own.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit CI passed on. Defaults to the triggering commit.
+        type: string
+        default: ""
+      branch:
+        description: Branch that receives the roll-up commit. Nothing is committed unless `ref` is its head.
+        type: string
+        default: develop
+      base:
+        description: Branch releases are cut from. A version section already on it is released, not pending.
+        type: string
+        default: main
+      changelog:
+        description: Path of the changelog, relative to the repository root.
+        type: string
+        default: CHANGELOG.md
+      tag-prefix:
+        description: Prefix of release tags; the version follows it.
+        type: string
+        default: v
+      bump:
+        description: >-
+          auto works the level out from the entries; patch, minor or major
+          forces it.
+        type: string
+        default: auto
+      dry-run:
+        description: Report the version and the rolled section and stop; commit nothing.
+        type: boolean
+        default: false
+      runs-on:
+        description: >-
+          Runner for the job: a label (ubuntu-latest) or a JSON array of labels,
+          e.g. '["self-hosted","linux"]'. The runner needs git, gh and jq.
+        type: string
+        default: ubuntu-latest
+    secrets:
+      token:
+        description: >-
+          Token used instead of GITHUB_TOKEN to commit the roll-up, so that CI
+          runs on it unprompted, or to bypass a branch ruleset.
+        required: false
+    outputs:
+      version:
+        description: The changelog's top version after this run, without the prefix.
+        value: ${{ jobs.roll.outputs.version }}
+      sha:
+        description: The commit to promote; the roll-up commit when one was made, otherwise `ref`.
+        value: ${{ jobs.roll.outputs.sha }}
+      rolled:
+        description: "'true' when this run committed a roll-up."
+        value: ${{ jobs.roll.outputs.rolled }}
+
+permissions:
+  contents: write
+
+jobs:
+  roll:
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    outputs:
+      version: ${{ steps.roll.outputs.version }}
+      sha: ${{ steps.roll.outputs.sha }}
+      rolled: ${{ steps.roll.outputs.rolled }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Roll the changelog into the next version
+        id: roll
+        env:
+          GH_TOKEN: ${{ secrets.token || github.token }}
+          CHANGELOG: ${{ inputs.changelog }}
+          PREFIX: ${{ inputs.tag-prefix }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          BASE_BRANCH: ${{ inputs.base }}
+          BUMP: ${{ inputs.bump }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          fail() { echo "::error::$*" >&2; exit 1; }
+
+          sha=$(git rev-parse HEAD)
+          [ -f "$CHANGELOG" ] || fail "$CHANGELOG not found."
+          case $BUMP in
+            auto|patch|minor|major) ;;
+            *) fail "bump must be auto, patch, minor or major, not \"$BUMP\"." ;;
+          esac
+
+          semver='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          linkdef='^\[[^]]+\]:\ '
+          # A list item that leads with the word, bold or not: `- BREAKING: ...`. A mention
+          # further into an entry does not count.
+          breaking='^[[:space:]]*[-*+][[:space:]]+(\*\*|__)?BREAKING'
+
+          # True when semantic version $1 is newer than $2. Cores compare numerically;
+          # on an equal core a release outranks a pre-release.
+          semver_gt() {
+            local a=$1 b=$2
+            if [ "${a%%-*}" != "${b%%-*}" ]; then
+              [ "$(printf '%s\n%s\n' "${a%%-*}" "${b%%-*}" | sort -V | tail -n 1)" = "${a%%-*}" ]
+              return
+            fi
+            case "$a/$b" in
+              *-*/*-*) [ "$a" != "$b" ] && [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n 1)" = "$a" ] ;;
+              *-*/*) return 1 ;;
+              */*-*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          # Drop the blank lines around stdin.
+          trim_blank() {
+            awk 'NF { seen = 1 } seen { buf[++n] = $0; if (NF) last = n } END { for (i = 1; i <= last; i++) print buf[i] }'
+          }
+
+          finish() {
+            {
+              echo "version=$1"
+              echo "sha=$2"
+              echo "rolled=$3"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          git fetch --quiet --force origin 'refs/tags/*:refs/tags/*'
+          git fetch --quiet --no-tags origin "+refs/heads/$BASE_BRANCH:refs/remotes/origin/$BASE_BRANCH" 2>/dev/null || true
+
+          # Split the changelog: the preamble, the [Unreleased] body, the top version
+          # section, and everything below it, which is kept as it is.
+          preamble=()
+          unreleased=()
+          top=()
+          rest=()
+          unreleased_heading=""
+          top_heading=""
+          top_version=""
+          state=preamble
+          while IFS= read -r line || [ -n "$line" ]; do
+            if [ "$state" != rest ] && [[ $line =~ ^##\ \[([^]]+)\] ]]; then
+              name=${BASH_REMATCH[1]}
+              if [ "$state" = preamble ] && [ "${name,,}" = unreleased ]; then
+                state=unreleased
+                unreleased_heading=$line
+                continue
+              fi
+              if [ "$state" != top ]; then
+                state=top
+                top_heading=$line
+                top_version=$name
+                continue
+              fi
+              state=rest
+            fi
+            case $state in
+              preamble) preamble+=("$line") ;;
+              unreleased) unreleased+=("$line") ;;
+              top) top+=("$line") ;;
+              rest) rest+=("$line") ;;
+            esac
+          done < "$CHANGELOG"
+
+          # The top version section is pending while it is neither tagged nor on the
+          # base branch: it was rolled by an earlier run and has not been released.
+          pending=false
+          if [ -n "$top_version" ] \
+            && ! git rev-parse -q --verify "refs/tags/$PREFIX$top_version" > /dev/null; then
+            pending=true
+            on_base=$(git show "origin/$BASE_BRANCH:$CHANGELOG" 2>/dev/null || true)
+            if grep -qF -- "## [$top_version]" <<< "$on_base"; then
+              pending=false
+            fi
+          fi
+          if [ "$pending" = true ] && ! [[ $top_version =~ $semver ]]; then
+            fail "Top section \"$top_version\" in $CHANGELOG is not a semantic version (X.Y.Z)."
+          fi
+
+          # Entries are gathered per `### Category`, in order of first appearance. Lines
+          # ahead of the first category are kept under the key ":loose". Link reference
+          # definitions move to the end of the file.
+          categories=()
+          declare -A title=() body=()
+          links=()
+          absorbed=0
+          add_chunk() {
+            local key=$1 text
+            text=$(printf '%s' "$2" | trim_blank)
+            [ -n "$text" ] || return 0
+            if [ -n "${body[$key]:-}" ]; then
+              body[$key]+=$'\n'"$text"
+            else
+              body[$key]=$text
+            fi
+            absorbed=$((absorbed + 1))
+          }
+          absorb() {
+            local key=":loose" chunk="" entry heading
+            for entry in "$@"; do
+              if [[ $entry =~ $linkdef ]]; then
+                links+=("$entry")
+              elif [[ $entry =~ ^###\ +(.*[^[:space:]])[[:space:]]*$ ]]; then
+                add_chunk "$key" "$chunk"
+                chunk=""
+                heading=${BASH_REMATCH[1]}
+                key=${heading,,}
+                if [ -z "${title[$key]:-}" ]; then
+                  title[$key]=$heading
+                  categories+=("$key")
+                fi
+              else
+                chunk+=$entry$'\n'
+              fi
+            done
+            add_chunk "$key" "$chunk"
+          }
+
+          if [ "$pending" = true ]; then
+            absorb ${top[@]+"${top[@]}"}
+          fi
+          before=$absorbed
+          absorb ${unreleased[@]+"${unreleased[@]}"}
+          has_unreleased=false
+          [ "$absorbed" -gt "$before" ] && has_unreleased=true
+
+          current=""
+          [[ $top_version =~ $semver ]] && current=$top_version
+          if [ "$absorbed" -eq 0 ] || { [ "$pending" = false ] && [ "$has_unreleased" = false ]; }; then
+            echo "[Unreleased] has no entries; nothing to roll."
+            finish "$current" "$sha" false
+          fi
+
+          level="patch"
+          [ -n "${body[added]:-}" ] && level=minor
+          for key in ":loose" ${categories[@]+"${categories[@]}"}; do
+            [ -n "${body[$key]:-}" ] || continue
+            if [[ $key == breaking* ]] || grep -Eq -- "$breaking" <<< "${body[$key]}"; then
+              level=major
+            fi
+          done
+          [ "$BUMP" = auto ] || level=$BUMP
+
+          # Bump from the newest release: the highest stable tag, or the changelog's
+          # newest released section when that is ahead of the tags.
+          from=0.0.0
+          while IFS= read -r t; do
+            v=${t#"$PREFIX"}
+            [[ $v =~ $semver && $v != *-* ]] || continue
+            if semver_gt "$v" "$from"; then from=$v; fi
+          done < <(git tag --list "${PREFIX}*")
+          released=$top_version
+          if [ "$pending" = true ]; then
+            released=""
+            if [ "${#rest[@]}" -gt 0 ] && [[ ${rest[0]} =~ ^##\ \[([^]]+)\] ]]; then
+              released=${BASH_REMATCH[1]}
+            fi
+          fi
+          if [[ $released =~ $semver && $released != *-* ]] && semver_gt "$released" "$from"; then
+            from=$released
+          fi
+
+          IFS=. read -r major minor patch <<< "$from"
+          if [ "$level" = major ] && [ "$major" -eq 0 ]; then level=minor; fi
+          case $level in
+            major) next="$((major + 1)).0.0" ;;
+            minor) next="$major.$((minor + 1)).0" ;;
+            patch) next="$major.$minor.$((patch + 1))" ;;
+          esac
+          # A tagged pre-release of a later version is a floor: 2.0.0-rc.1 is followed by
+          # 2.0.0, not by 1.4.1.
+          while IFS= read -r t; do
+            v=${t#"$PREFIX"}
+            [[ $v =~ $semver && $v == *-* ]] || continue
+            if semver_gt "${v%%-*}" "$next"; then next=${v%%-*}; fi
+          done < <(git tag --list "${PREFIX}*")
+
+          version=$next
+          if [ "$pending" = true ]; then
+            # A pre-release heading was written by hand and is kept; otherwise the pending
+            # version only ever moves up.
+            if [[ $top_version == *-* ]] || semver_gt "$top_version" "$next"; then
+              version=$top_version
+            fi
+            if [ "$has_unreleased" = false ] && [ "$version" = "$top_version" ]; then
+              echo "$top_version is already rolled and [Unreleased] has no entries; nothing to roll."
+              finish "$top_version" "$sha" false
+            fi
+          fi
+
+          section=$(mktemp)
+          {
+            if [ -n "${body[:loose]:-}" ]; then
+              printf '%s\n\n' "${body[:loose]}"
+            fi
+            for key in ${categories[@]+"${categories[@]}"}; do
+              [ -n "${body[$key]:-}" ] || continue
+              printf '### %s\n%s\n\n' "${title[$key]}" "${body[$key]}"
+            done
+          } | trim_blank > "$section"
+
+          rolled=$(mktemp)
+          {
+            [ "${#preamble[@]}" -eq 0 ] || printf '%s\n' "${preamble[@]}"
+            if [ -n "$unreleased_heading" ]; then
+              printf '%s\n\n' "$unreleased_heading"
+            fi
+            printf '## [%s] - %s\n\n' "$version" "$(date -u +%F)"
+            cat "$section"
+            echo
+            if [ "$pending" = false ] && [ -n "$top_heading" ]; then
+              printf '%s\n' "$top_heading" ${top[@]+"${top[@]}"}
+            fi
+            [ "${#rest[@]}" -eq 0 ] || printf '%s\n' "${rest[@]}"
+            if [ "${#links[@]}" -gt 0 ]; then
+              echo
+              printf '%s\n' "${links[@]}"
+            fi
+          } | trim_blank > "$rolled"
+
+          {
+            echo "## Next release: $PREFIX$version"
+            echo
+            echo "A $level bump from $PREFIX$from."
+            echo
+            cat "$section"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DRY_RUN" = true ]; then
+            echo "Dry run: $CHANGELOG would be rolled into $version (a $level bump from $from)."
+            finish "$version" "$sha" false
+          fi
+
+          branch_head() {
+            gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$TARGET_BRANCH" --jq .object.sha
+          }
+          moved() {
+            echo "::notice::$TARGET_BRANCH moved on from ${sha:0:7}; the run for its new head rolls the changelog."
+            finish "$current" "$sha" false
+          }
+          [ "$(branch_head)" = "$sha" ] || moved
+
+          encoded=$(mktemp)
+          base64 -w 0 "$rolled" > "$encoded"
+          # createCommitOnBranch, not git push: GitHub signs the commit, and
+          # expectedHeadOid refuses it when the branch moved under this run.
+          # shellcheck disable=SC2016
+          query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }'
+          out=$(mktemp)
+          if ! jq -n \
+            --arg query "$query" \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg branch "$TARGET_BRANCH" \
+            --arg oid "$sha" \
+            --arg headline "chore(release): roll changelog into $version" \
+            --arg path "$CHANGELOG" \
+            --rawfile contents "$encoded" \
+            '{query: $query, variables: {input: {
+               branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+               expectedHeadOid: $oid,
+               message: {headline: $headline},
+               fileChanges: {additions: [{path: $path, contents: $contents}]}}}}' \
+            | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid > "$out" 2>&1; then
+            cat "$out" >&2
+            [ "$(branch_head)" = "$sha" ] || moved
+            fail "Committing the roll-up to $TARGET_BRANCH was refused. A branch ruleset that requires pull requests applies to GITHUB_TOKEN too: pass a \`token\` that may bypass it."
+          fi
+          commit=$(cat "$out")
+          [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "Unexpected answer to the roll-up commit: $commit"
+
+          echo "Rolled $CHANGELOG into $version at ${commit:0:7} on $TARGET_BRANCH."
+          {
+            echo
+            echo "Committed as \`${commit:0:7}\` on \`$TARGET_BRANCH\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+          finish "$version" "$commit" true
