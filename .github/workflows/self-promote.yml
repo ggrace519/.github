@@ -1,11 +1,14 @@
 name: self-promote
 
 # This repository's own promotion. After lint passes on a develop push it rolls
-# the changelog into the next version (version.yml) and opens or refreshes the
-# develop → main pull request (promote.yml). On a pull request into develop it
-# only reports the release that pull request would produce. Both reusable
-# workflows are called from the same commit, so a change to them is exercised
-# here first.
+# the changelog into the next version and opens or refreshes a roll-up pull
+# request into develop (version.yml). Once that is merged there is nothing left
+# to roll, and it opens or refreshes the develop → main pull request
+# (promote.yml). On a pull request into develop it only reports the release that
+# pull request would produce. Both reusable workflows are called from the same
+# commit, so a change to them is exercised here first. Both open their pull
+# requests as the GitHub App named by the RELEASE_APP_CLIENT_ID variable and
+# RELEASE_APP_PRIVATE_KEY secret, or with GITHUB_TOKEN while those are unset.
 
 on:
   workflow_run:
@@ -37,8 +40,10 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       github.event.pull_request.head.repo.full_name == github.repository
+    # version.yml declares pull-requests: write, and a caller must grant at least that.
     permissions:
       contents: write
+      pull-requests: write
     uses: ./.github/workflows/version.yml
     with:
       dry-run: true
@@ -51,16 +56,26 @@ jobs:
        github.event.workflow_run.event == 'push')
     permissions:
       contents: write
+      pull-requests: write
     uses: ./.github/workflows/version.yml
     with:
       ref: ${{ github.event.workflow_run.head_sha }}
       bump: ${{ inputs.bump || 'auto' }}
+      app-client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
   promote:
     needs: version
+    # Not while a roll-up pull request is open (the run its merge starts promotes), and not
+    # for a commit that develop has moved past (the run for the newer one does).
+    if: needs.version.outputs.promote == 'true'
     permissions:
       contents: read
       pull-requests: write
     uses: ./.github/workflows/promote.yml
     with:
       ref: ${{ needs.version.outputs.sha }}
+      app-client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+    secrets:
+      app-private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}

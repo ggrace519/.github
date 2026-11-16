@@ -1,38 +1,118 @@
 #!/usr/bin/env bash
-# Test double for the two GitHub API calls version.yml makes. It answers them from
-# the local bare repository in $REMOTE, so a roll-up becomes a real git commit there.
+# Test double for the GitHub API calls version.yml makes. It answers them from the
+# local bare repository in $REMOTE: branches are its refs, so a roll-up becomes a real
+# git commit there, and pull requests and their comments are kept in $REMOTE/prs.json.
 #   STUB_REFUSE=1    the commit mutation is refused
-#   STUB_REF_FAIL=1  reading the branch head fails
+#   STUB_REF_FAIL=1  reading a branch fails
+#   STUB_PR_RACE=1   opening a pull request fails because another run just opened it
+#   STUB_MOVE=1      the target branch gains a commit right after the roll-up commit
+#   STUB_REF_502=b   reading branch b fails with a server error
 set -euo pipefail
-if [ "$1 $2" = "api graphql" ]; then
-  req=$(cat)
-  if [ -n "${STUB_REFUSE:-}" ]; then
-    echo "GraphQL: refused" >&2
-    exit 1
-  fi
-  branch=$(jq -r .variables.input.branch.branchName <<< "$req")
-  expect=$(jq -r .variables.input.expectedHeadOid <<< "$req")
-  head=$(git -C "$REMOTE" rev-parse "refs/heads/$branch")
-  if [ "$head" != "$expect" ]; then
-    echo "GraphQL: Expected branch to point to $expect but it did not" >&2
-    exit 1
-  fi
-  work=$(mktemp -d)
-  git clone -q -b "$branch" "$REMOTE" "$work"
-  path=$(jq -r '.variables.input.fileChanges.additions[0].path' <<< "$req")
-  jq -r '.variables.input.fileChanges.additions[0].contents' <<< "$req" | base64 -d > "$work/$path"
-  git -C "$work" commit -qam "$(jq -r .variables.input.message.headline <<< "$req")"
-  git -C "$work" push -q origin "$branch"
-  echo "gh stub: a warning on stderr must not break the caller" >&2
-  git -C "$work" rev-parse HEAD
-  rm -rf "$work"
-elif [[ "$1 $2" == "api repos/"*"/git/ref/heads/"* ]]; then
-  if [ -n "${STUB_REF_FAIL:-}" ]; then
-    echo "gh: HTTP 502" >&2
-    exit 1
-  fi
-  git -C "$REMOTE" rev-parse "refs/heads/${2##*/git/ref/heads/}"
-else
-  echo "gh stub: unexpected call: $*" >&2
-  exit 64
-fi
+[ "${1:-}" = api ] || { echo "gh stub: unexpected call: $*" >&2; exit 64; }
+shift
+method=GET
+if [ "${1:-}" = --method ]; then method=$2; shift 2; fi
+path=$1; shift
+declare -A field=()
+input=false
+while [ $# -gt 0 ]; do
+  case $1 in
+    # -F sends true as a JSON boolean; GitHub refuses the string "true" for force.
+    -f) [ "${2%%=*}" != force ] || { echo "gh stub: force must be sent with -F" >&2; exit 64; }
+        field[${2%%=*}]=${2#*=}; shift 2 ;;
+    -F) field[${2%%=*}]=${2#*=}; shift 2 ;;
+    --input) input=true; shift 2 ;;
+    --jq) shift 2 ;;
+    *) echo "gh stub: unexpected flag: $1" >&2; exit 64 ;;
+  esac
+done
+req='{}'
+if [ "$input" = true ]; then req=$(cat); fi
+prs="$REMOTE/prs.json"
+[ -f "$prs" ] || echo '[]' > "$prs"
+save() { local t; t=$(mktemp); cat > "$t"; mv "$t" "$prs"; }
+
+case "$method $path" in
+  "GET graphql")
+    if [ -n "${STUB_REFUSE:-}" ]; then
+      echo "GraphQL: refused" >&2
+      exit 1
+    fi
+    branch=$(jq -r .variables.input.branch.branchName <<< "$req")
+    expect=$(jq -r .variables.input.expectedHeadOid <<< "$req")
+    head=$(git -C "$REMOTE" rev-parse "refs/heads/$branch")
+    if [ "$head" != "$expect" ]; then
+      echo "GraphQL: Expected branch to point to $expect but it did not" >&2
+      exit 1
+    fi
+    work=$(mktemp -d)
+    git clone -q -b "$branch" "$REMOTE" "$work"
+    file=$(jq -r '.variables.input.fileChanges.additions[0].path' <<< "$req")
+    jq -r '.variables.input.fileChanges.additions[0].contents' <<< "$req" | base64 -d > "$work/$file"
+    git -C "$work" commit -qam "$(jq -r .variables.input.message.headline <<< "$req")"
+    git -C "$work" push -q origin "$branch"
+    echo "gh stub: a warning on stderr must not break the caller" >&2
+    git -C "$work" rev-parse HEAD
+    if [ -n "${STUB_MOVE:-}" ]; then
+      git -C "$work" fetch -q origin develop && git -C "$work" switch -q --detach origin/develop
+      git -C "$work" commit -q --allow-empty -m "merged meanwhile" && git -C "$work" push -q origin HEAD:develop
+    fi
+    rm -rf "$work"
+    ;;
+  "GET repos/"*"/git/ref/heads/"*)
+    if [ -n "${STUB_REF_FAIL:-}" ] || [ "${STUB_REF_502:-}" = "${path##*/git/ref/heads/}" ]; then
+      echo "gh: HTTP 502" >&2
+      exit 1
+    fi
+    git -C "$REMOTE" rev-parse -q --verify "refs/heads/${path##*/git/ref/heads/}" || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+    ;;
+  "POST repos/"*"/git/refs")
+    ref=${field[ref]}
+    if git -C "$REMOTE" rev-parse -q --verify "$ref" > /dev/null; then echo "gh: Reference already exists (HTTP 422)" >&2; exit 1; fi
+    git -C "$REMOTE" update-ref "$ref" "${field[sha]}"
+    ;;
+  "PATCH repos/"*"/git/refs/heads/"*)
+    ref=refs/heads/${path##*/git/refs/heads/}
+    git -C "$REMOTE" rev-parse -q --verify "$ref" > /dev/null || { echo "gh: Reference does not exist (HTTP 422)" >&2; exit 1; }
+    [ "${field[force]:-}" = true ] || { echo "gh stub: only forced ref updates are expected" >&2; exit 64; }
+    git -C "$REMOTE" update-ref "$ref" "${field[sha]}"
+    ;;
+  "DELETE repos/"*"/git/refs/heads/"*)
+    ref=refs/heads/${path##*/git/refs/heads/}
+    git -C "$REMOTE" rev-parse -q --verify "$ref" > /dev/null || { echo "gh: Reference does not exist (HTTP 422)" >&2; exit 1; }
+    git -C "$REMOTE" update-ref -d "$ref"
+    # GitHub closes an open pull request whose branch is deleted.
+    jq --arg h "${ref#refs/heads/}" 'map(if .head == $h and .state == "open" then .state = "closed" else . end)' "$prs" | save
+    ;;
+  "GET repos/"*"/pulls?"*)
+    query=${path#*\?}
+    declare -A q=()
+    IFS='&' read -ra kv <<< "$query"
+    for p in "${kv[@]}"; do q[${p%%=*}]=${p#*=}; done
+    jq -r --arg s "${q[state]}" --arg b "${q[base]}" --arg h "${q[head]#*:}" \
+      'map(select(.state == $s and .base == $b and .head == $h)) | .[0].number // empty' "$prs"
+    ;;
+  "POST repos/"*"/pulls")
+    n=$(jq 'length + 1' "$prs")
+    jq --argjson n "$n" --argjson r "$req" '. + [$r + {number: $n, state: "open", comments: []}]' "$prs" | save
+    if [ -n "${STUB_PR_RACE:-}" ]; then
+      echo "gh: Validation Failed: A pull request already exists for o:$(jq -r .head <<< "$req"). (HTTP 422)" >&2
+      exit 1
+    fi
+    echo "$n"
+    ;;
+  "PATCH repos/"*"/pulls/"*)
+    n=${path##*/pulls/}
+    upd=$req
+    if [ -n "${field[state]:-}" ]; then upd=$(jq -n --arg s "${field[state]}" '{state: $s}'); fi
+    jq --argjson n "$n" --argjson u "$upd" 'map(if .number == $n then . + $u else . end)' "$prs" | save
+    ;;
+  "POST repos/"*"/issues/"*"/comments")
+    n=${path%/comments}; n=${n##*/}
+    jq --argjson n "$n" --arg c "${field[body]}" 'map(if .number == $n then .comments += [$c] else . end)' "$prs" | save
+    ;;
+  *)
+    echo "gh stub: unexpected call: $method $path" >&2
+    exit 64
+    ;;
+esac

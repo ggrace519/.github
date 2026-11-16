@@ -4,8 +4,10 @@ name: version
 # CHANGELOG.md and semantic versions. Run it on the integration branch (develop)
 # after CI passes and before `promote`. It works out the next version from the
 # entries under `## [Unreleased]`, moves them into a dated `## [X.Y.Z]` section
-# and commits that to the branch, so the promotion pull request already carries
-# the changelog that `release` tags on the merge.
+# and opens a pull request with that into the branch. Merging the pull request
+# is the decision to release; the next run then has nothing to roll, and
+# `promote` opens the promotion pull request with the changelog that `release`
+# tags on the merge.
 #
 # The version is the latest release bumped by the highest level its entries ask
 # for: an entry that starts with BREAKING or a `### Breaking` heading is a major
@@ -14,10 +16,12 @@ name: version
 # branch is pending: later entries fold into it and its version is worked out
 # again, never downwards, so a hand-edited heading stands.
 #
-# The commit is made through the API, so GitHub signs it. Made with
-# GITHUB_TOKEN it starts no `push` workflow, and the `pull_request` run it
-# causes on an open promotion pull request waits for approval. Pass a `token`
-# secret to have both run on their own.
+# The pull request comes from `chore/roll-changelog`, a branch this workflow
+# owns: every run rebuilds it as the branch head plus one roll-up commit, and
+# deletes it once there is nothing left to roll. The commit is made through the
+# API, so GitHub signs it. Give the workflow a GitHub App (`app-client-id` and
+# `app-private-key`) to open the pull request as the app, so that its checks run
+# on their own; with GITHUB_TOKEN GitHub holds them until someone approves the run.
 
 on:
   workflow_call:
@@ -27,7 +31,7 @@ on:
         type: string
         default: ""
       branch:
-        description: Branch that receives the roll-up commit. Nothing is committed unless `ref` is its head.
+        description: Branch the roll-up pull request targets. Nothing is written unless `ref` is its head.
         type: string
         default: develop
       base:
@@ -49,7 +53,7 @@ on:
         type: string
         default: auto
       dry-run:
-        description: Report the version and the rolled section and stop; commit nothing.
+        description: Report the version and the rolled section and stop; write no branch and no pull request.
         type: boolean
         default: false
       runs-on:
@@ -58,25 +62,37 @@ on:
           e.g. '["self-hosted","linux"]'. The runner needs git, gh and jq.
         type: string
         default: ubuntu-latest
-    secrets:
-      token:
+      app-client-id:
         description: >-
-          Token used instead of GITHUB_TOKEN to commit the roll-up, so that CI
-          runs on it unprompted, or to bypass a branch ruleset.
+          Client ID of a GitHub App installed on the repository with Contents and
+          Pull requests read and write. Empty uses GITHUB_TOKEN.
+        type: string
+        default: ""
+    secrets:
+      app-private-key:
+        description: Private key (the whole .pem) of the app named by `app-client-id`.
         required: false
     outputs:
       version:
         description: The changelog's top version after this run, without the prefix.
         value: ${{ jobs.roll.outputs.version }}
       sha:
-        description: The commit to promote; the roll-up commit when one was made, otherwise `ref`.
+        description: The commit the run looked at (`ref`); the one to promote when `pull-request` is empty.
         value: ${{ jobs.roll.outputs.sha }}
-      rolled:
-        description: "'true' when this run committed a roll-up."
-        value: ${{ jobs.roll.outputs.rolled }}
+      pull-request:
+        description: >-
+          Number of the roll-up pull request this run opened or updated; empty when
+          there was nothing to roll.
+        value: ${{ jobs.roll.outputs.pull-request }}
+      promote:
+        description: >-
+          'true' when `ref` is the head of `branch` and nothing is left to roll: the
+          caller should run `promote` for `sha`. Never 'true' on a dry run.
+        value: ${{ jobs.roll.outputs.promote }}
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   roll:
@@ -84,17 +100,32 @@ jobs:
     outputs:
       version: ${{ steps.roll.outputs.version }}
       sha: ${{ steps.roll.outputs.sha }}
-      rolled: ${{ steps.roll.outputs.rolled }}
+      pull-request: ${{ steps.roll.outputs.pull-request }}
+      promote: ${{ steps.roll.outputs.promote }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
 
+      # No continue-on-error: an app that is configured but cannot mint a token (not
+      # installed on this repository, a wrong key) fails the run instead of quietly
+      # falling back to GITHUB_TOKEN.
+      - name: Mint the app token
+        id: app
+        if: inputs.app-client-id != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ inputs.app-client-id }}
+          private-key: ${{ secrets.app-private-key }}
+          permission-contents: write
+          permission-pull-requests: write
+
       - name: Roll the changelog into the next version
         id: roll
         env:
-          GH_TOKEN: ${{ secrets.token || github.token }}
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          TOKEN_SOURCE: ${{ steps.app.outputs.token && format('the app {0}', steps.app.outputs.app-slug) || 'GITHUB_TOKEN' }}
           CHANGELOG: ${{ inputs.changelog }}
           PREFIX: ${{ inputs.tag-prefix }}
           TARGET_BRANCH: ${{ inputs.branch }}
@@ -141,13 +172,79 @@ jobs:
             awk 'NF { seen = 1 } seen { buf[++n] = $0; if (NF) last = n } END { for (i = 1; i <= last; i++) print buf[i] }'
           }
 
+          # finish <version> [<pull request>] [promote]
           finish() {
             {
               echo "version=$1"
-              echo "sha=$2"
-              echo "rolled=$3"
+              echo "sha=$sha"
+              echo "pull-request=${2:-}"
+              echo "promote=${3:-false}"
             } >> "$GITHUB_OUTPUT"
             exit 0
+          }
+
+          repo=$GITHUB_REPOSITORY
+          roll_branch=chore/roll-changelog
+          staging=$roll_branch-staging
+
+          branch_head() {
+            gh api "repos/$repo/git/ref/heads/$TARGET_BRANCH" --jq .object.sha
+          }
+          # $TARGET_BRANCH no longer ends at this commit. When it moved on, the run for its
+          # new head does the work; a commit that was never on it is a wrong `ref`.
+          not_head() {
+            git fetch --quiet --no-tags origin "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
+            if ! git merge-base --is-ancestor "$sha" "origin/$TARGET_BRANCH"; then
+              fail "${sha:0:7} is not on $TARGET_BRANCH. Run this workflow for a commit of $TARGET_BRANCH; a manual run must be started from that branch."
+            fi
+            echo "::notice::$TARGET_BRANCH moved on from ${sha:0:7}; the run for its new head rolls the changelog."
+            finish "$current"
+          }
+          # Nothing is written for a commit that is not the branch head.
+          require_head() {
+            local head
+            head=$(branch_head) || fail "Could not read the head of $TARGET_BRANCH."
+            [ "$head" = "$sha" ] || not_head
+          }
+          # A missing branch is a 404; any other failure is not taken for one.
+          ref_exists() {
+            local err
+            err=$(gh api "repos/$repo/git/ref/heads/$1" 2>&1 > /dev/null) && return 0
+            [[ $err == *"HTTP 404"* ]] && return 1
+            fail "Could not read the branch $1: $err"
+          }
+          # Point branch $1 at commit $2, creating it when needed.
+          point() {
+            if ref_exists "$1"; then
+              gh api --method PATCH "repos/$repo/git/refs/heads/$1" -f sha="$2" -F force=true > /dev/null
+            else
+              gh api --method POST "repos/$repo/git/refs" -f ref="refs/heads/$1" -f sha="$2" > /dev/null
+            fi
+          }
+          find_pr() {
+            gh api "repos/$repo/pulls?state=open&base=$TARGET_BRANCH&head=${repo%%/*}:$roll_branch" --jq '.[0].number // empty'
+          }
+          # Nothing left to roll: close the roll-up pull request and delete its branch, which
+          # is still there after a merge unless the repository deletes merged branches, and
+          # a staging branch that a cancelled run left behind. Then `ref` may be promoted.
+          retire() {
+            local pr b
+            [ "$DRY_RUN" != true ] || finish "$1"
+            require_head
+            pr=$(find_pr) || fail "Could not look up the roll-up pull request."
+            if [ -n "$pr" ]; then
+              gh api --method POST "repos/$repo/issues/$pr/comments" \
+                -f body="$TARGET_BRANCH has nothing left to roll, so this roll-up pull request is closed." > /dev/null
+              gh api --method PATCH "repos/$repo/pulls/$pr" -f state=closed > /dev/null
+              echo "Closed the roll-up pull request #$pr."
+            fi
+            for b in "$roll_branch" "$staging"; do
+              if ref_exists "$b"; then
+                gh api --method DELETE "repos/$repo/git/refs/heads/$b" > /dev/null
+                echo "Deleted $b."
+              fi
+            done
+            finish "$1" "" true
           }
 
           git fetch --quiet --force origin 'refs/tags/*:refs/tags/*'
@@ -271,7 +368,7 @@ jobs:
           [[ $top_version =~ $semver ]] && current=$top_version
           if [ "$absorbed" -eq 0 ] || { [ "$pending" = false ] && [ "$has_unreleased" = false ]; }; then
             echo "[Unreleased] has no entries; nothing to roll."
-            finish "$current" "$sha" false
+            retire "$current"
           fi
 
           level="patch"
@@ -327,7 +424,7 @@ jobs:
             fi
             if [ "$has_unreleased" = false ] && [ "$version" = "$top_version" ]; then
               echo "$top_version is already rolled and [Unreleased] has no entries; nothing to roll."
-              finish "$top_version" "$sha" false
+              retire "$top_version"
             fi
           fi
 
@@ -379,39 +476,27 @@ jobs:
 
           if [ "$DRY_RUN" = true ]; then
             echo "Dry run: $CHANGELOG would be rolled into $version (a $level bump from $from)."
-            finish "$version" "$sha" false
+            finish "$version"
           fi
 
-          branch_head() {
-            gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$TARGET_BRANCH" --jq .object.sha
-          }
-          # $TARGET_BRANCH no longer ends at this commit. When it moved on, the run for its
-          # new head rolls the changelog; a commit that was never on it is a wrong `ref`.
-          not_head() {
-            git fetch --quiet --no-tags origin "+refs/heads/$TARGET_BRANCH:refs/remotes/origin/$TARGET_BRANCH"
-            if ! git merge-base --is-ancestor "$sha" "origin/$TARGET_BRANCH"; then
-              fail "${sha:0:7} is not on $TARGET_BRANCH. Run this workflow for a commit of $TARGET_BRANCH; a manual run must be started from that branch."
-            fi
-            echo "::notice::$TARGET_BRANCH moved on from ${sha:0:7}; the run for its new head rolls the changelog."
-            finish "$current" "$sha" false
-          }
-          head=$(branch_head) || fail "Could not read the head of $TARGET_BRANCH."
-          [ "$head" = "$sha" ] || not_head
-
+          require_head
           encoded=$(mktemp)
           base64 < "$rolled" | tr -d '\n' > "$encoded"
-          # createCommitOnBranch, not git push: GitHub signs the commit, and
-          # expectedHeadOid refuses it when the branch moved under this run.
+          pr_title="chore(release): roll changelog into $version"
+          # The commit is built on a scratch branch and the roll-up branch is then moved onto
+          # it: a pull request whose branch points at the base commit, even for a moment, is
+          # closed by GitHub. createCommitOnBranch, not git push, so that GitHub signs it.
           # shellcheck disable=SC2016
           query='mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }'
+          point "$staging" "$sha"
           out=$(mktemp)
           err=$(mktemp)
           if ! jq -n \
             --arg query "$query" \
-            --arg repo "$GITHUB_REPOSITORY" \
-            --arg branch "$TARGET_BRANCH" \
+            --arg repo "$repo" \
+            --arg branch "$staging" \
             --arg oid "$sha" \
-            --arg headline "chore(release): roll changelog into $version" \
+            --arg headline "$pr_title" \
             --arg path "$CHANGELOG" \
             --rawfile contents "$encoded" \
             '{query: $query, variables: {input: {
@@ -421,16 +506,61 @@ jobs:
                fileChanges: {additions: [{path: $path, contents: $contents}]}}}}' \
             | gh api graphql --input - --jq .data.createCommitOnBranch.commit.oid > "$out" 2> "$err"; then
             cat "$out" "$err" >&2
-            head=$(branch_head) || fail "Committing the roll-up failed, and so did reading the head of $TARGET_BRANCH."
-            [ "$head" = "$sha" ] || not_head
-            fail "Committing the roll-up to $TARGET_BRANCH was refused. A branch ruleset that requires pull requests applies to GITHUB_TOKEN too: pass a \`token\` that may bypass it."
+            gh api --method DELETE "repos/$repo/git/refs/heads/$staging" > /dev/null 2>&1 || true
+            fail "Committing the roll-up to $staging was refused. A branch ruleset that covers chore/ branches applies to this workflow's token too."
           fi
           commit=$(cat "$out")
           [[ $commit =~ ^[0-9a-f]{40}$ ]] || fail "Unexpected answer to the roll-up commit: $commit"
+          # The staging branch was just set to $sha, so expectedHeadOid cannot tell whether
+          # $TARGET_BRANCH moved meanwhile. Check again before the pull request changes.
+          head=$(branch_head) || fail "Could not read the head of $TARGET_BRANCH."
+          if [ "$head" != "$sha" ]; then
+            gh api --method DELETE "repos/$repo/git/refs/heads/$staging" > /dev/null
+            not_head
+          fi
+          point "$roll_branch" "$commit"
+          gh api --method DELETE "repos/$repo/git/refs/heads/$staging" > /dev/null
 
-          echo "Rolled $CHANGELOG into $version at ${commit:0:7} on $TARGET_BRANCH."
+          pr_body=$(mktemp)
+          {
+            echo "Rolls the \`[Unreleased]\` entries of \`$CHANGELOG\` into **$PREFIX$version**, a $level bump from $PREFIX$from."
+            echo
+            echo "Merging this pull request is the decision to release $PREFIX$version: the next run opens or refreshes the promotion pull request, and merging that one tags the release. Use a merge commit."
+            echo
+            echo "## $PREFIX$version"
+            echo
+            cat "$section"
+            echo
+            echo "Maintained by the shared \`version\` workflow. Every run on \`$TARGET_BRANCH\` rebuilds \`$roll_branch\` as its head plus this one commit, so do not push to it and put notes in a comment."
+          } > "$pr_body"
+
+          # REST, not gh pr edit: that command queries Projects (classic) and fails once
+          # GitHub returns the deprecation error.
+          update_pr() {
+            jq -n --arg title "$pr_title" --rawfile body "$pr_body" '{title: $title, body: $body}' \
+              | gh api --method PATCH "repos/$repo/pulls/$1" --input - > /dev/null
+            echo "Updated the roll-up pull request #$1."
+          }
+          pr=$(find_pr) || fail "Could not look up the roll-up pull request."
+          if [ -n "$pr" ]; then
+            update_pr "$pr"
+          elif pr=$(jq -n --arg title "$pr_title" --rawfile body "$pr_body" --arg head "$roll_branch" --arg base "$TARGET_BRANCH" \
+              '{title: $title, body: $body, head: $head, base: $base}' \
+              | gh api --method POST "repos/$repo/pulls" --input - --jq .number 2> "$err"); then
+            echo "Opened the roll-up pull request #$pr."
+          else
+            # Another run may have opened it in the meantime.
+            pr=$(find_pr) || true
+            if [ -z "$pr" ]; then
+              cat "$err" >&2
+              fail "Opening the roll-up pull request failed. Workflows may open pull requests only when the repository allows it (Settings → Actions → General)."
+            fi
+            update_pr "$pr"
+          fi
+
+          echo "Rolled $CHANGELOG into $version at ${commit:0:7} on $roll_branch, pull request #$pr."
           {
             echo
-            echo "Committed as \`${commit:0:7}\` on \`$TARGET_BRANCH\`."
+            echo "Committed as \`${commit:0:7}\` on \`$roll_branch\`; roll-up pull request #$pr, opened with $TOKEN_SOURCE."
           } >> "$GITHUB_STEP_SUMMARY"
-          finish "$version" "$commit" true
+          finish "$version" "$pr"
