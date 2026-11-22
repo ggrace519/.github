@@ -148,7 +148,7 @@ if has_ref "$ROLL"; then no "roll-up branch deleted"; else ok "roll-up branch de
 
 echo "a staging branch left by a cancelled run is cleaned up"; mkrepo v1.1.0
 git -C "$REMOTE" update-ref "refs/heads/$ROLL-staging" "$(git -C "$REMOTE" rev-parse develop)"
-roll; eq rc "$rc" 0; eq promote "$out_promote" true
+roll; eq rc "$rc" 0; eq promote "$out_promote" false
 if has_ref "$ROLL-staging"; then no "staging deleted"; else ok "staging deleted"; fi
 
 echo "a branch that cannot be read is not taken for a missing one"; mkrepo v1.1.0
@@ -202,9 +202,13 @@ new_changelog "$(unrel $'### Fixed\n- x')"; roll; eq version "$out_version" 1.1.
 eq "1.1.0 section intact" "$(cl | grep -c '^## \[1.1.0\] - 2026-11-07$')" 1
 eq "old entry stays in 1.1.0" "$(cl | sed -n '/^## \[1.1.0\]/,$p' | grep -c 'old feature')" 1
 
-echo "nothing to roll"; mkrepo v1.1.0; h=$(git -C "$W" rev-parse HEAD); roll; eq rc "$rc" 0; eq pull-request "$out_pr" ""; eq promote "$out_promote" true; eq sha "$out_sha" "$h"; eq version "$out_version" 1.1.0
+echo "nothing to roll and the top version released: no promotion"; mkrepo v1.1.0; h=$(git -C "$W" rev-parse HEAD); roll; eq rc "$rc" 0; eq pull-request "$out_pr" ""; eq promote "$out_promote" false; eq sha "$out_sha" "$h"; eq version "$out_version" 1.1.0
 roll DRY_RUN=true; eq "dry run never promotes" "$out_promote" false
 if has_ref "$ROLL"; then no "no roll-up branch"; else ok "no roll-up branch"; fi
+echo "a change with no changelog entry after a release is not promoted"; mkrepo v1.1.0
+echo docs > "$W/NOTES.md"; git -C "$W" add NOTES.md; git -C "$W" commit -qm docs; git -C "$W" push -q origin develop
+roll; eq rc "$rc" 0; eq promote "$out_promote" false; eq pull-request "$out_pr" ""
+if grep -q '::notice::develop has no changelog entries after v1.1.0, so there is nothing to promote' "$R/log"; then ok notice; else no "notice: $(cat "$R/log")"; fi
 echo "empty category headings only"; mkrepo v1.1.0; new_changelog "$(unrel $'### Added\n\n### Fixed')"; roll; eq pull-request "$out_pr" ""
 
 echo "dry run"; mkrepo v1.1.0; new_changelog "$(unrel $'### Added\n- x')"; h=$(git -C "$W" rev-parse HEAD)
