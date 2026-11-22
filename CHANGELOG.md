@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-11-22
+
+### Fixed
+- `version` no longer reports `promote: 'true'` when `[Unreleased]` is empty and the top version is already released. A change merged into `develop` without a changelog entry, such as a docs edit, used to open a promotion pull request whose `release` check could never pass. The run now leaves a notice, and the change goes out with the next release.
+
 ## [2.0.0] - 2026-11-16
 
 ### Changed

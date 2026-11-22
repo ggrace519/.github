@@ -86,8 +86,9 @@ on:
         value: ${{ jobs.roll.outputs.pull-request }}
       promote:
         description: >-
-          'true' when `ref` is the head of `branch` and nothing is left to roll: the
-          caller should run `promote` for `sha`. Never 'true' on a dry run.
+          'true' when `ref` is the head of `branch`, nothing is left to roll and the top
+          version section is rolled but not yet released: the caller should run
+          `promote` for `sha`. Never 'true' on a dry run.
         value: ${{ jobs.roll.outputs.promote }}
 
 permissions:
@@ -226,7 +227,8 @@ jobs:
           }
           # Nothing left to roll: close the roll-up pull request and delete its branch, which
           # is still there after a merge unless the repository deletes merged branches, and
-          # a staging branch that a cancelled run left behind. Then `ref` may be promoted.
+          # a staging branch that a cancelled run left behind. retire <version> [promote]:
+          # `ref` may be promoted only when it carries a rolled, unreleased version.
           retire() {
             local pr b
             [ "$DRY_RUN" != true ] || finish "$1"
@@ -244,7 +246,7 @@ jobs:
                 echo "Deleted $b."
               fi
             done
-            finish "$1" "" true
+            finish "$1" "" "${2:-false}"
           }
 
           git fetch --quiet --force origin 'refs/tags/*:refs/tags/*'
@@ -368,6 +370,8 @@ jobs:
           [[ $top_version =~ $semver ]] && current=$top_version
           if [ "$absorbed" -eq 0 ] || { [ "$pending" = false ] && [ "$has_unreleased" = false ]; }; then
             echo "[Unreleased] has no entries; nothing to roll."
+            # No rolled, unreleased version: a promotion would fail `release`, so none is made.
+            echo "::notice::$TARGET_BRANCH has no changelog entries${current:+ after $PREFIX$current}, so there is nothing to promote. Add an entry under [Unreleased] to release its changes."
             retire "$current"
           fi
 
@@ -424,7 +428,7 @@ jobs:
             fi
             if [ "$has_unreleased" = false ] && [ "$version" = "$top_version" ]; then
               echo "$top_version is already rolled and [Unreleased] has no entries; nothing to roll."
-              retire "$top_version"
+              retire "$top_version" true
             fi
           fi
 
